@@ -31,7 +31,7 @@ services:
     environment:
       MC_HOST_local: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000 
       #declare its host: service minio and its alias: local
-    command: ["mb", "--ignore-existing", "local/landing", "local/silver"]
+    command: ["mb", "--ignore-existing", "local/landing", "local/warehouse"]
        #make bucket, local: alias for host, ignore if bucket existed
     restart: "no"
     networks:
@@ -63,6 +63,48 @@ services:
       start_period: 30s
     restart: "unless-stopped"
     networks:
+      - lakehouse
+  #catalog: iceberg-REST
+  iceberg-rest:
+    pull_policy: build
+    build:
+      context:
+        ./docker/catalog
+    image: uusima-rent-prices/iceberg-rest:1.10.1
+    container_name: iceberg-rest
+    env_file: .env
+    environment: 
+      #connect to Postgres to store pointers
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog 
+      #implement jdbc catalog type
+      CATALOG_URI: jdbc:postgresql://postgres:5432/iceberg_catalog 
+      #jdbc connection URL to postgres
+      CATALOG_JDBC_USER: iceberg 
+      CATALOG_JDBC_PASSWORD: ${CATALOG_DB_PASSWORD}
+      CATALOG_JDBC_SCHEMA__VERSION: V1
+      #connect to minio to store metadata files
+      CATALOG_WAREHOUSE: s3://warehouse/  #send s3 api req to warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO #s3fileio implement
+      CATALOG_S3_ENDPOINT: http://minio:9000 #s3 api end point
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8181:8181"
+    restart: "unless-stopped"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8181/v1/config || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: 
       - lakehouse
 volumes:
   minio-data:
