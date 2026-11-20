@@ -32,12 +32,41 @@ services:
       MC_HOST_local: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000 
       #declare its host: service minio and its alias: local
     command: ["mb", "--ignore-existing", "local/landing", "local/silver"]
-       #make bucket, local: alias, ignore if bucket existed
+       #make bucket, local: alias for host, ignore if bucket existed
     restart: "no"
+    networks:
+      - lakehouse
+  postgres:
+    image: postgis/postgis:17-3.7-alpine #intergrate postgis for openstreetmap
+    container_name: postgres
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      CATALOG_DB_PASSWORD: ${CATALOG_DB_PASSWORD}
+      HOUSING_DB_PASSWORD: ${HOUSING_DB_PASSWORD}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql #postgres save data to its default location and volume pg-data manages it
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+      #docker engine mount sql files in docker/postgres/initdb to container and postgres entrypoint detect and run them
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: "unless-stopped"
     networks:
       - lakehouse
 volumes:
   minio-data:
+  pg-data:
 networks:
   lakehouse:
     name: lakehouse
