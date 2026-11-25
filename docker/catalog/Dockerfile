@@ -9,3 +9,4 @@ ADD --chmod=644 \
 CMD ["java", "-cp", \
      "/usr/lib/iceberg-rest/iceberg-rest-adapter.jar:/usr/lib/iceberg-rest/postgresql.jar", \
      "org.apache.iceberg.rest.RESTCatalogServer"]
+#needs to build catalog image because original image does not have Postgres Driver

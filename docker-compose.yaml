@@ -1,3 +1,64 @@
+#shared airflow config block
+x-airflow-common: &airflow-common #alias
+  pull_policy: build
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  image: uusima-rent-prices/airflow:3.4.0-spark4.0.5
+  user: "50000:0" #userID:groupID => airflowuser:root
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    #interface with user, password, roles
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://airflow:${AIRFLOW_DB_PASSWORD}@postgres:5432/airflow
+    #protocol://user:password@host:port/databasename
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    #fernet key to protect and secure the db
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    #execution api for task execution env to communicate with airflow api server
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    #secret for task and api to auth
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false" #not load example dag
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true" #not auto start dag when first created
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__CORE__PARALLELISM: 8 #6 main dag and 2 for reserve
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 4 #now 1, 4 for later
+    AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 1 #no overlap run
+    AIRFLOW__API__WORKERS: 2 #1 is ok but 2 for fall back
+    SPARK_CONF_DIR: /opt/spark/conf #dir of spark config
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    AWS_REGION: us-east-1
+    TZ: UTC
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./jobs:/opt/airflow/jobs
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./docker/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    - spark-events:/opt/spark/events
+  networks:
+    - lakehouse
+  restart: unless-stopped
+x-spark-common: &spark-common
+  build:
+    context: ./docker/spark
+  image: uusima-rent-prices/spark:4.0.5-iceberg1.10.1-py312
+  pull_policy: build
+  environment: &spark-env
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    AWS_REGION: us-east-1
+    SPARK_DAEMON_MEMORY: 512m
+    TZ: UTC
+  volumes:
+    - ./docker/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    - spark-events:/opt/spark/events
+  networks:
+    - lakehouse
+  restart: unless-stopped
+
 services:
   minio:
     image: pgsty/silo:RELEASE.2026-11-12T00-00-00Z #lock 1 image
@@ -106,9 +167,145 @@ services:
       start_period: 30s
     networks: 
       - lakehouse
+  airflow-init: #create metadata db, account, pool, restart = no
+    <<: *airflow-common
+    user: "0:0"
+    restart: "no"
+    entrypoint: /bin/bash
+    command: #max 4 playwright, 1 spark job at a time
+        - -c
+        - |
+          set -e
+          mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins /opt/airflow/jobs
+          chown -R 50000:0 /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins /opt/airflow/jobs
+          chmod 777 /opt/spark/events
+          /entrypoint airflow version
+          airflow pools set chromium 4 "Playwright crawl_list (B)" 
+          airflow pools set spark 1 "Spark jobs (S)"
+    environment:
+        <<: *airflow-env
+        _AIRFLOW_DB_MIGRATE: "true"
+        _AIRFLOW_WWW_USER_CREATE: "true"
+        _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
+        _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    depends_on:
+        postgres:
+          condition: service_healthy
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    hostname: airflow-apiserver
+    command: api-server
+    ports:
+      - "8080:8080"
+    mem_limit: 800m
+    cpus: 1
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    hostname: airflow-scheduler     # executor call driver through this host name
+    command: scheduler
+    mem_limit: 5100m                # 0,6 scheduler + 4×0,8 Chromium + 1×1,1 driver + 1×0,15 light task
+    cpus: 5.6                       # 1 scheduler + 4×1 chromium + 0,5 driver + 0,1 light task
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      iceberg-rest:
+        condition: service_healthy
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    hostname: airflow-dag-processor
+    command: dag-processor
+    mem_limit: 300m
+    cpus: 0.5
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    hostname: airflow-triggerer
+    command: triggerer
+    mem_limit: 200m
+    cpus: 0.25
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+ 
+  spark-master:
+    <<: *spark-common
+    container_name: spark-master
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    ports:
+      - "8090:8080"     #interface (8080 accomodated by airflow)
+    mem_limit: 500m
+    cpus: 0.25
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  spark-worker:
+    <<: *spark-common
+    container_name: spark-worker
+    hostname: spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      <<: *spark-env
+      SPARK_WORKER_CORES: 1        # = S × spark.cores.max = 1 x 1 = 1
+      SPARK_WORKER_MEMORY: 768m    # = S × spark.executor.memory = 1 x 768m (heap only)
+      PYSPARK_PYTHON: python3.12
+    ports:
+      - "8091:8081"     #interface, 8091 to be same in pattern with spark master
+    mem_limit: 1700m    # 0,5 daemon + 1×1,15 executor (heap+non heap)
+    cpus: 1.25 # 0,25 daemon + 1x1 executor.cores
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081 || exit 1"]
+      interval: 1m30s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+
+  spark-history:
+    <<: *spark-common
+    container_name: spark-history
+    hostname: spark-history
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.history.HistoryServer"]
+    ports:
+      - "18080:18080"
+    mem_limit: 500m
+    cpus: 0.25
+
 volumes:
   minio-data:
   pg-data:
+  spark-events:
 networks:
   lakehouse:
     name: lakehouse
